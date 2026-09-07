@@ -280,6 +280,10 @@ function createConnectionService({ dataDir, log, nowIso, store, getServerDef, mc
         const credValue = credential && typeof credential.value === 'string' ? credential.value : '';
         updateRecord(rec.id, { status: 'connected', error: null });
         try {
+            // explicit discovering state: the connect succeeded, now we're
+            // enumerating tools. This makes the lifecycle honest and visible:
+            //   connected → discovering → ready (or failed)
+            updateRecord(rec.id, { status: 'discovering', error: null });
             await mcpManager.connect(def, { force: true, connection: { id: rec.id, credential: credValue } });
             const st = mcpManager.statusView(def, { connection: { id: rec.id } });
             // ready only after a REAL connect + tool discovery: the manager
@@ -526,6 +530,40 @@ function createConnectionService({ dataDir, log, nowIso, store, getServerDef, mc
         return f ? { serverId: f.serverId, ownerUid: f.ownerUid, connectionId: f.connectionId } : null;
     }
 
+    // ── in-app API-key connection (no external HTML page needed) ────────────
+    // Combines startConnect + completeSetup into one call so the settings UI
+    // can connect an api_key server without navigating to /mcp/setup/<flow>.
+    // For oauth servers, returns the authorizeUrl so the UI can open it.
+    async function connectInApp({ serverId, uid, apiKey, baseUrl }) {
+        const def = getServerDef(String(serverId || ''));
+        if (!def) return { ok: false, error: 'unknown_connection', message: 'No MCP server with that id.' };
+        if (!def.enabled) return { ok: false, error: 'disabled', message: `"${def.name}" is disabled.` };
+        const auth = def.auth || 'none';
+        if (auth === 'none') {
+            return { ok: true, serverId: def.id, name: def.name, status: 'ready', message: `"${def.name}" is instance-shared — no personal connection needed.` };
+        }
+        // For api_key: create flow + complete it in one step
+        if (auth === 'api_key') {
+            const key = String(apiKey || '').trim();
+            if (!key) return { ok: false, error: 'missing_key', message: 'An API key is required.' };
+            let rec = findConnection(def.id, uid);
+            if (!rec) rec = createRecord(def.id, uid, 'authorizing');
+            else updateRecord(rec.id, { status: 'authorizing', error: null });
+            const flowId = randomToken(24);
+            setupFlows.set(flowId, { serverId: def.id, ownerUid: uid, connectionId: rec.id, createdAt: Date.now(), used: false });
+            say(`[MCP-CONN] in-app api-key flow: ${def.id} owner=${uid} flow=${flowId.slice(0, 8)}…`);
+            const r = await completeSetup({ flowId, keyValue: key });
+            return { ok: r.ok, serverId: def.id, name: def.name, status: r.status || (r.ok ? 'ready' : 'failed'), error: r.error, message: r.ok ? `"${def.name}" is connected and ready.` : `Connection failed: ${r.error ? r.error.code : 'unknown error'}` };
+        }
+        // For oauth: return the authorize URL (UI opens it in a new tab)
+        if (auth === 'oauth') {
+            const start = await startConnect({ serverId: def.id, uid, confirm: true, baseUrl });
+            if (!start.ok) return start;
+            return { ok: true, serverId: def.id, name: def.name, status: 'authorizing', authorizeUrl: start.authorizeUrl || start.setupUrl, message: `Open the authorization URL to connect "${def.name}".` };
+        }
+        return { ok: false, error: 'unsupported_auth', message: `Auth type "${auth}" is not supported for in-app connection.` };
+    }
+
     return {
         CONTROL_SYSTEM_NOTE,
         controlToolDefs,
@@ -536,6 +574,7 @@ function createConnectionService({ dataDir, log, nowIso, store, getServerDef, mc
         startConnect,
         completeOAuth,
         completeSetup,
+        connectInApp,
         disconnectConnection,
         revokeById,
         getSetupFlow,
